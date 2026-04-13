@@ -1,9 +1,12 @@
-import json
-import os
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from sqlalchemy.orm import Session
 from typing import List
+from database import init_db, get_db, Branch, Checkpoint
+from database import User
+
+
+init_db()
 
 app = FastAPI()
 
@@ -14,80 +17,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_FILE = "data.json"
 
+@app.post("/register")
+def register(username: str, passw: str, db: Session = Depends(get_db)):
+    new_user = User(username=username, password=passw)
+    db.add(new_user)
+    db.commit()
+    return {"status": "Юзер создан!"} 
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {"xp": 0, "branches": []}
-    return {"xp": 0, "branches": []}
-
-def save_db(data):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-
-class Checkpoint(BaseModel):
-    id: int
-    name: str
-    difficulty: str
-    done: bool = False
-
-class Branch(BaseModel):
-    id: int
-    title: str
-    checkpoints: List[Checkpoint] = []
-
-
-@app.get("/data")
-def get_data():
-    return load_db()
+@app.get("/data/{user_id}")
+def get_data(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Юзер не найден")
+        
+    branches = db.query(Branch).all() 
+    return {
+        "username": user.username,
+        "xp": user.xp, 
+        "level": (user.xp // 500) + 1, 
+        "branches": branches
+    }
 
 @app.post("/add_branch")
-def add_branch(title: str):
-    db = load_db()
-    new_id = len(db["branches"]) + 1
-    db["branches"].append({
-        "id": new_id,
-        "title": title,
-        "checkpoints": []
-    })
-    save_db(db)
-    return {"status": "ok", "id": new_id}
+def add_branch(title: str, db: Session = Depends(get_db)):
+    new_branch = Branch(title=title)
+    db.add(new_branch)
+    db.commit()
+    db.refresh(new_branch)
+    return {"status": "ok", "id": new_branch.id}
 
 @app.post("/add_cp/{branch_id}")
-def add_checkpoint(branch_id: int, name: str, diff: str):
-    db = load_db()
-    branch = next((b for b in db["branches"] if b["id"] == branch_id), None)
-    if branch:
-        new_cp = {
-            "id": len(branch["checkpoints"]) + 1,
-            "name": name,
-            "difficulty": diff,
-            "done": False
-        }
-        branch["checkpoints"].append(new_cp)
-        save_db(db)
-        return new_cp
-    return {"error": "Ветка не найдена"}
+def add_checkpoint(branch_id: int, name: str, diff: str, db: Session = Depends(get_db)):
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    
+    new_cp = Checkpoint(name=name, difficulty=diff, branch_id=branch_id)
+    db.add(new_cp)
+    db.commit()
+    db.refresh(new_cp)
+    return new_cp
 
-@app.post("/complete/{branch_id}/{cp_id}")
-def complete_checkpoint(branch_id: int, cp_id: int):
-    db = load_db()
-    branch = next((b for b in db["branches"] if b["id"] == branch_id), None)
-    if branch:
-        cp = next((c for c in branch["checkpoints"] if c["id"] == cp_id), None)
-        if cp and not cp["done"]:
-            cp["done"] = True
-            rewards = {"easy": 50, "medium": 150, "hard": 300}
-            db["xp"] += rewards.get(cp["difficulty"], 0)
-            save_db(db)
-            return db
-    return {"error": "Ошибка выполнения"}
+@app.post("/complete/{cp_id}")
+def complete_task(cp_id: int, user_id: int, db: Session = Depends(get_db)):
+    cp = db.query(Checkpoint).filter(Checkpoint.id == cp_id).first()
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if cp and user and not cp.done:
+        cp.done = True
+        rewards = {"easy": 10, "medium": 50, "hard": 100}
+        user.xp += rewards.get(cp.difficulty, 0)
+        
+        db.commit()
+        return {"new_xp": user.xp, "status": "Задание выполнено!"}
+    return {"error": "Ошибка: либо задача уже сделана, либо ппользователь не найден"}
+
+
+@app.delete("/delete_branch/{branch_id}")
+def delete_branch(branch_id: int, db: Session = Depends(get_db)):
+    branch = db.query(Branch).filter(Branch.id == branch_id).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Ветка не найдена")
+    
+    db.delete(branch)
+    db.commit()
+    return {"status": "deleted"}
 
 if __name__ == "__main__":
     import uvicorn
